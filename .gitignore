@@ -131,3 +131,6 @@ dmypy.json
 
 *.npy
 *.pth
+
+asmk/
+dust3r/
