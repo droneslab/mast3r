@@ -1,4 +1,3 @@
-
 import os
 import sys
 import torch
@@ -8,19 +7,17 @@ from typing import Tuple, List, Optional
 
 # Add mast3r root to path to ensure imports work
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# If mast3r package is in /home/yashturkar/Workspace/mast3r/, then that dir is the root.
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
 # Imports - let them fail if missing to aid debugging
 import mast3r.utils.path_to_dust3r
 from mast3r.model import AsymmetricMASt3R
-from mast3r.fast_nn import extract_correspondences_nonsym, fast_reciprocal_NNs
+from mast3r.fast_nn import fast_reciprocal_NNs
 
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
-from dust3r.utils.device import to_numpy
 
 class MASt3RModel:
     _instance = None
@@ -29,20 +26,12 @@ class MASt3RModel:
     @classmethod
     def get_instance(cls, device='cuda', model_name="MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"):
         if cls._instance is None:
-            # print(f"Loading MASt3R model: {model_name} on {device}")
-            # Notebook uses: "naver/{model_name}"
-            # model_name default in notebook: "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric"
             full_name = f"naver/{model_name}"
             model = AsymmetricMASt3R.from_pretrained(full_name).to(device)
             model.eval()
             cls._instance = model
             cls._device = device
         return cls._instance
-
-def to_numpy_safe(tensor):
-    if isinstance(tensor, torch.Tensor): 
-        return tensor.detach().cpu().numpy()
-    return np.array(tensor)
 
 def compute_matching_scores(
     img1_path: str, 
@@ -54,10 +43,10 @@ def compute_matching_scores(
 ) -> Tuple[float, float]:
     """
     Compute feature and geometric matching scores for a pair of images.
-    Logic replicated from mast3r_sequence_matching.ipynb.
     
     Returns:
-        (feat_score, geom_score)
+        (feat_score, geom_score) - both as ratios in [0, 1+] typically.
+        Higher = more matches = better matching quality.
     """
     if model is None:
         model = MASt3RModel.get_instance(device=device)
@@ -65,84 +54,60 @@ def compute_matching_scores(
     # Load images
     imgs = load_images([img1_path, img2_path], size=img_size, verbose=False)
     
-    # Make pairs
+    # Make pairs - symmetrize=True gives us 2 pairs: (0,1) and (1,0)
     pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
     
     # Inference
     with torch.no_grad():
         out = inference(pairs, model, device, batch_size=1, verbose=False)
     
-    # Extract predictions
-    # out keys are 'view1', 'view2', 'pred1', 'pred2'.
-    # keys in pred1 are (0, 1) and (1, 0) since symmetrize=True.
-    # Notebook logic iterates idx1, idx2 and gets pair (idx1, idx2).
-    # Since we loaded [img1, img2], indices are 0 and 1.
-    k = (0, 1)
-    if k not in out['pred1']:
-        # Should not happen with symmetrize=True/complete
+    # The output structure is FLAT:
+    # out['pred1'] contains tensors with batch dimension for all pairs
+    # Shape is [num_pairs, H, W, channels]
+    # With symmetrize=True and 2 images, we get 2 pairs: (0->1) and (1->0)
+    # We want the first pair (0->1), so index [0]
+    
+    pred1 = out['pred1']
+    pred2 = out['pred2']
+    
+    # Check required keys exist
+    if 'pts3d' not in pred1 or 'desc' not in pred1 or 'conf' not in pred1:
+        print("Warning: Missing required keys in pred1")
         return 0.0, 0.0
-            
-    # Notebook extracts:
-    # pts3d_1 = to_numpy_safe(out["pred1"]["pts3d"])[0]
-    # pts3d_2 = to_numpy_safe(out["pred2"]["pts3d_in_other_view"])[0] 
-    # Wait, in notebook the pair was constructed from a list of frames.
-    # Here 'out' structure for pair (0,1):
-    # 'pred1' is for img0, 'pred2' is for img1 (aligned to img0?)
-    # Actually 'pred2' contains predictions for view2. 
-    # 'pts3d_in_other_view' is specific key?
-    # Let's trust the notebook key "pts3d_in_other_view" exists in pred2.
     
-    # Also handle batch dimension [0]
-    pred1_k = out['pred1'][k]
-    pred2_k = out['pred2'][k] # This key might differ if dust3r version changed?
+    # Extract tensors for first pair (img1 -> img2)
+    # The tensors should already be on device from inference
+    desc1 = pred1['desc'][0]      # Shape: [H, W, 24]
+    desc2 = pred2['desc'][0]
     
-    # Check if 'pts3d_in_other_view' exists, else fallback to 'pts3d'
-    # But usually 'pts3d' in pred2 is in view2 coords. 'pts3d_in_other_view' might be aligned.
-    # If using AsymmetricMASt3R, it likely outputs it.
-    
-    pts3d_1 = to_numpy_safe(pred1_k['pts3d'])[0]
-    if 'pts3d_in_other_view' in pred2_k:
-        pts3d_2 = to_numpy_safe(pred2_k['pts3d_in_other_view'])[0]
+    # For geometric matching, use the 3D points
+    pts3d_1 = pred1['pts3d'][0]  # Shape: [H, W, 3]
+    if 'pts3d_in_other_view' in pred2:
+        pts3d_2 = pred2['pts3d_in_other_view'][0]
     else:
-        # Fallback if key missing (though notebook used it)
-        pts3d_2 = to_numpy_safe(pred2_k['pts3d'])[0]
-
-    conf1 = to_numpy_safe(pred1_k['conf'])[0]
-    conf2 = to_numpy_safe(pred2_k['conf'])[0]
+        pts3d_2 = pred2['pts3d'][0]
     
-    desc1 = to_numpy_safe(pred1_k['desc'])[0]
-    desc2 = to_numpy_safe(pred2_k['desc'])[0]
-    
-    # Feature matching
-    # Notebook:
-    # feat_xy1, feat_xy2, feat_conf = extract_correspondences_nonsym(
-    #     torch.from_numpy(desc1), torch.from_numpy(desc2),
-    #     torch.from_numpy(conf1), torch.from_numpy(conf2)
-    # )
-    
-    feat_xy1, feat_xy2, feat_conf = extract_correspondences_nonsym(
-        torch.from_numpy(desc1), torch.from_numpy(desc2),
-        torch.from_numpy(conf1), torch.from_numpy(conf2)
+    # Feature matching using descriptors with fast_reciprocal_NNs
+    # This is what works in our debug test - it found 577 matches
+    feat_xy1, feat_xy2 = fast_reciprocal_NNs(
+        desc1, desc2,
+        subsample_or_initxy1=subsample,
+        device=device,
+        dist='dot',
+        block_size=2**13
     )
     
-    # Geometric matching
-    # Notebook:
-    # geom_xy1, geom_xy2 = fast_reciprocal_NNs(
-    #     torch.from_numpy(pts3d_1),
-    #     torch.from_numpy(pts3d_2),
-    #     subsample_or_initxy1=subsample
-    # )
-    
+    # Geometric matching using 3D points
     geom_xy1, geom_xy2 = fast_reciprocal_NNs(
-        torch.from_numpy(pts3d_1),
-        torch.from_numpy(pts3d_2),
-        subsample_or_initxy1=subsample
+        pts3d_1, pts3d_2,
+        subsample_or_initxy1=subsample,
+        device=device,
+        dist='dot',
+        block_size=2**13
     )
     
-    # Scores
-    # Notebook: total_grid_points = (img_size // subsample) * (img_size // subsample) * 2
-    # Verify H, W from actual output to be safe?
-    H, W = pts3d_1.shape[:2]
+    # Compute scores as ratio of matches to total grid points
+    H, W = desc1.shape[:2]
     total_grid_points = (H // subsample) * (W // subsample) * 2
     
     if total_grid_points <= 0:
