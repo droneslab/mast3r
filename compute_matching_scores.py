@@ -123,7 +123,8 @@ def encode_images(
     paths: List[Optional[str]], 
     model: Optional[torch.nn.Module] = None,
     device: str = 'cuda',
-    img_size: int = 512
+    img_size: int = 512,
+    batch_size: int = 8
 ) -> List[Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """
     Encode multiple images in batch, returning descriptors, 3D points, and confidence for each.
@@ -133,6 +134,7 @@ def encode_images(
         model: MASt3R model instance (will create if None)
         device: Device to run inference on
         img_size: Target image size for resizing
+        batch_size: Batch size for inference (how many self-pairs to process together)
         
     Returns:
         List of (descriptors, pts3d, conf) tuples, or None for invalid/missing images.
@@ -163,43 +165,68 @@ def encode_images(
         # Results already initialized with None
         return results
     
-    # Encode each image by creating a self-pair (image with itself)
-    # This allows us to use the existing inference pipeline
+    # Batch encode all images by creating self-pairs and processing in batches
+    # Create self-pairs: duplicate each image to create (img, img) pairs
+    # We'll process these in batches for better GPU utilization
     encoded_features = []
+    num_images = len(imgs)
     
-    for img in imgs:
+    # Process images in batches
+    for batch_start in range(0, num_images, batch_size):
+        batch_end = min(batch_start + batch_size, num_images)
+        batch_imgs = imgs[batch_start:batch_end]
+        batch_size_actual = len(batch_imgs)
+        
         try:
-            # Create self-pair: image with itself (duplicate the image to create a valid pair)
-            img_list = [img, img]  # Duplicate to create a proper pair
-            pairs = make_pairs(img_list, scene_graph='complete', prefilter=None, symmetrize=False)
+            # Create self-pairs for this batch
+            # Each self-pair is created by duplicating an image: [img, img]
+            # make_pairs returns a list of pairs, so we combine them
+            all_pairs = []
+            for img in batch_imgs:
+                # Create self-pair: [img, img]
+                img_pair_list = [img, img]
+                # make_pairs with 2 images and complete graph creates 1 pair (0->1)
+                pairs = make_pairs(img_pair_list, scene_graph='complete', prefilter=None, symmetrize=False)
+                all_pairs.extend(pairs)
             
-            # Run inference on self-pair
+            # Run batched inference on all self-pairs
             with torch.no_grad():
-                out = inference(pairs, model, device, batch_size=1, verbose=False)
+                out = inference(all_pairs, model, device, batch_size=batch_size_actual, verbose=False)
             
             pred1 = out['pred1']
             
             # Check required keys exist
-            if 'pts3d' not in pred1 or 'desc' not in pred1 or 'conf' not in pred1:
-                encoded_features.append(None)
+            if 'pts3d' not in pred1 or 'desc' not in pred1:
+                # If batch failed, fall back to None for this batch
+                encoded_features.extend([None] * batch_size_actual)
                 continue
             
-            # Extract features from pred1 (self-pair, so pred1 has the image's own features)
-            desc = pred1['desc'][0]      # Shape: [H, W, 24]
-            pts3d = pred1['pts3d'][0]   # Shape: [H, W, 3]
-            conf = pred1.get('conf', None)
-            if conf is not None:
-                conf = conf[0]          # Shape: [H, W, 1] or similar
-            else:
-                # If conf is not available, create a dummy tensor
-                H, W = desc.shape[:2]
-                conf = torch.ones((H, W, 1), device=desc.device, dtype=desc.dtype)
-            
-            encoded_features.append((desc, pts3d, conf))
-            
+            # Extract features for each image in the batch
+            # pred1['desc'] has shape [num_pairs, H, W, channels]
+            # We have batch_size_actual pairs (one per image)
+            for i in range(batch_size_actual):
+                try:
+                    desc = pred1['desc'][i]      # Shape: [H, W, 24]
+                    pts3d = pred1['pts3d'][i]     # Shape: [H, W, 3]
+                    conf = pred1.get('conf', None)
+                    if conf is not None:
+                        conf = conf[i]          # Shape: [H, W, 1] or similar
+                    else:
+                        # If conf is not available, create a dummy tensor
+                        H, W = desc.shape[:2]
+                        conf = torch.ones((H, W, 1), device=desc.device, dtype=desc.dtype)
+                    
+                    encoded_features.append((desc, pts3d, conf))
+                except (IndexError, KeyError) as e:
+                    print(f"Warning: Failed to extract features for image {batch_start + i}: {e}")
+                    encoded_features.append(None)
+                    
         except Exception as e:
-            print(f"Warning: Failed to encode image: {e}")
-            encoded_features.append(None)
+            print(f"Warning: Failed to encode batch starting at {batch_start}: {e}")
+            import traceback
+            traceback.print_exc()
+            # Add None for all images in this failed batch
+            encoded_features.extend([None] * batch_size_actual)
     
     # Map encoded features back to original indices
     encoded_idx = 0
@@ -278,7 +305,8 @@ def compute_matching_scores_batch(
     device: str = 'cuda',
     img_size: int = 512,
     subsample: int = 8,
-    verbose: bool = False
+    verbose: bool = False,
+    encode_batch_size: int = 8
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute K×K matching scores for two sets of images efficiently.
@@ -292,6 +320,7 @@ def compute_matching_scores_batch(
         img_size: Target image size for resizing
         subsample: Subsampling factor for matching
         verbose: If True, print timing information
+        encode_batch_size: Batch size for encoding images (how many to process together)
         
     Returns:
         (feat_scores, geom_scores) - both as numpy arrays of shape [K, K]
@@ -310,10 +339,10 @@ def compute_matching_scores_batch(
     feat_scores = np.zeros((K, K), dtype=np.float32)
     geom_scores = np.zeros((K, K), dtype=np.float32)
     
-    # Encode all images at t and t+1 once
+    # Encode all images at t and t+1 once (with batching)
     encode_start = time.time()
-    encoded_t = encode_images(paths_t, model=model, device=device, img_size=img_size)
-    encoded_t1 = encode_images(paths_t1, model=model, device=device, img_size=img_size)
+    encoded_t = encode_images(paths_t, model=model, device=device, img_size=img_size, batch_size=encode_batch_size)
+    encoded_t1 = encode_images(paths_t1, model=model, device=device, img_size=img_size, batch_size=encode_batch_size)
     encode_time = time.time() - encode_start
     
     if verbose:
